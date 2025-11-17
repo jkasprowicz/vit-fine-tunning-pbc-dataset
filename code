@@ -1,0 +1,334 @@
+# Full single-cell script: Fine-tune multilabel ViT on PBC (single-label -> converted to multi-hot)
+import os
+import random
+import numpy as np
+from PIL import Image
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import timm
+from sklearn.metrics import (
+    precision_recall_fscore_support, classification_report,
+    roc_auc_score, roc_curve, auc
+)
+import matplotlib.pyplot as plt
+
+# -------------------------
+# 0) User config - EDIT if needed
+# -------------------------
+DEVICE = "cuda:0"                # change to your GPU (e.g., "cuda:5")
+SEED = 42
+PBC_PATH = "/lapix/pbc_dataset/PBC_dataset_split/PBC_dataset_split"  # root with Train/Val folders
+MODEL_WEIGHTS_PATH = "vit_base_multilabel_best.pth"  # your pretrained 14-class model
+OUTPUT_BEST_MODEL = "finetuned_PBC_multilabel_best.pth"
+BATCH_SIZE = 16
+LR = 1e-5
+WEIGHT_DECAY = 1e-2
+EPOCHS = 50
+PATIENCE = 7
+NUM_WORKERS = 4
+IMG_SIZE = 384
+
+# -------------------------
+# 1) Reproducibility / Seed
+# -------------------------
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+# -------------------------
+# 2) Model class names (exact order used during training)
+#    Use the list you provided earlier. Keep order exactly as in training CSV header.
+# -------------------------
+MODEL_CLASS_NAMES = [
+    "Artefato",
+    "Basofilo",
+    "Bastonete",
+    "Blasto",
+    "Eosinofilo",
+    "Eritroblasto",
+    "Linfocito",
+    "Linfocito atipico",
+    "Metamielocito",
+    "Mielocito",
+    "Monocito",
+    "Neutrofilo segmentado",
+    "Promielocito",
+    "Restos celulares"
+]
+
+NUM_CLASSES = len(MODEL_CLASS_NAMES)
+
+# -------------------------
+# 3) Mapping PBC folder -> model class name
+#    (PBC is single-label; we map it to the corresponding single class in your 14-class space)
+# -------------------------
+PBC_TO_MODEL = {
+    'basophil': 'Basofilo',
+    'eosinophil': 'Eosinofilo',
+    'erythroblast': 'Eritroblasto',
+    'lymphocyte': 'Linfocito',
+    'monocyte': 'Monocito',
+    'neutrophil': 'Neutrofilo segmentado'
+}
+
+# Validate mapping keys vs train folders
+expected_pbc_keys = set(PBC_TO_MODEL.keys())
+found_folders = set([f for f in os.listdir(os.path.join(PBC_PATH, "Train")) if os.path.isdir(os.path.join(PBC_PATH, "Train", f))])
+missing = expected_pbc_keys - found_folders
+if missing:
+    print(f"Warning: expected PBC folders {missing} not found in Train folder. Found: {found_folders}")
+
+# -------------------------
+# 4) Dataset: convert single-label PBC -> multi-hot vector (14 dims)
+# -------------------------
+class PBCFineTuneDataset(Dataset):
+    def __init__(self, root_dir, split="Train", transform=None, mapping=None, model_classes=None):
+        self.root = os.path.join(root_dir, split)
+        self.transform = transform
+        self.mapping = mapping or {}
+        self.model_classes = model_classes or []
+        self.samples = []  # list of (img_path, pbc_label_foldername)
+
+        # iterate folders (each folder name is the pbc label)
+        for pbc_cls in sorted(os.listdir(self.root)):
+            folder = os.path.join(self.root, pbc_cls)
+            if not os.path.isdir(folder):
+                continue
+            for fname in sorted(os.listdir(folder)):
+                # skip hidden files
+                if fname.startswith('.'):
+                    continue
+                self.samples.append((os.path.join(folder, fname), pbc_cls))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, pbc_label = self.samples[idx]
+        image = Image.open(path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+
+        # Map pbc label -> model class name
+        if pbc_label not in self.mapping:
+            raise KeyError(f"PBC label '{pbc_label}' not in mapping dictionary.")
+        model_label_name = self.mapping[pbc_label]
+
+        # Build multi-hot vector (14 dims), only mapped class = 1
+        target = torch.zeros(len(self.model_classes), dtype=torch.float32)
+        pos_idx = self.model_classes.index(model_label_name)
+        target[pos_idx] = 1.0
+
+        return image, target
+
+# -------------------------
+# 5) Transforms + Dataloaders
+# -------------------------
+train_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
+    transforms.ToTensor()
+])
+
+val_tf = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor()
+])
+
+train_dataset = PBCFineTuneDataset(PBC_PATH, split="Train", transform=train_tf, mapping=PBC_TO_MODEL, model_classes=MODEL_CLASS_NAMES)
+val_dataset   = PBCFineTuneDataset(PBC_PATH, split="Val",   transform=val_tf,  mapping=PBC_TO_MODEL, model_classes=MODEL_CLASS_NAMES)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
+val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+
+# -------------------------
+# 6) Create model and load weights (safe load if possible)
+# -------------------------
+model = timm.create_model("vit_base_patch16_384", pretrained=False, num_classes=NUM_CLASSES)
+
+# safe torch.load: try weights_only=True (newer PyTorch), fallback to old call
+try:
+    state = torch.load(MODEL_WEIGHTS_PATH, map_location="cpu", weights_only=True)
+except TypeError:
+    # older torch doesn't support weights_only param
+    state = torch.load(MODEL_WEIGHTS_PATH, map_location="cpu")
+
+# if file is a state_dict or full checkpoint, handle both
+if isinstance(state, dict) and "state_dict" in state:
+    state_dict = state["state_dict"]
+else:
+    state_dict = state
+
+model.load_state_dict(state_dict)
+print("✅ Pretrained weights loaded.")
+
+model.to(DEVICE)
+
+# Freeze backbone (train only head) — this is safe FT; you can unfreeze later if needed
+for name, p in model.named_parameters():
+    if "head" not in name:
+        p.requires_grad = False
+
+# -------------------------
+# 7) Loss, optimizer, scheduler, amp scaler
+# -------------------------
+criterion = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=WEIGHT_DECAY)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.1, min_lr=1e-7)
+
+# Use modern amp API
+scaler = torch.amp.GradScaler(device='cuda')
+
+# -------------------------
+# 8) Training loop with early stopping & best-model saving
+# -------------------------
+best_val_loss = float("inf")
+early_counter = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    running_train_loss = 0.0
+
+    for imgs, targets in train_loader:
+        imgs = imgs.to(DEVICE, non_blocking=True)
+        targets = targets.to(DEVICE, non_blocking=True)
+
+        optimizer.zero_grad()
+        with torch.amp.autocast(device_type='cuda'):
+            logits = model(imgs)                     # shape (B, 14)
+            loss = criterion(logits, targets)        # BCEWithLogits expects floats (multi-hot)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        running_train_loss += loss.item() * imgs.size(0)
+
+    avg_train_loss = running_train_loss / len(train_loader.dataset)
+
+    # Validation
+    model.eval()
+    running_val_loss = 0.0
+    with torch.no_grad():
+        for imgs, targets in val_loader:
+            imgs = imgs.to(DEVICE, non_blocking=True)
+            targets = targets.to(DEVICE, non_blocking=True)
+            with torch.amp.autocast(device_type='cuda'):
+                logits = model(imgs)
+                loss = criterion(logits, targets)
+            running_val_loss += loss.item() * imgs.size(0)
+
+    avg_val_loss = running_val_loss / len(val_loader.dataset)
+    scheduler.step(avg_val_loss)
+
+    print(f"Epoch {epoch+1}/{EPOCHS} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+    # Early stopping & save
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        early_counter = 0
+        torch.save(model.state_dict(), OUTPUT_BEST_MODEL)
+        print(f"  -> New best model saved (val_loss={best_val_loss:.4f})")
+    else:
+        early_counter += 1
+        if early_counter >= PATIENCE:
+            print("Early stopping triggered.")
+            break
+
+# -------------------------
+# 9) Load best model and evaluate (multilabel metrics)
+# -------------------------
+model.load_state_dict(torch.load(OUTPUT_BEST_MODEL, map_location=DEVICE))
+model.to(DEVICE)
+model.eval()
+
+all_logits = []
+all_targets = []
+
+with torch.no_grad():
+    for imgs, targets in val_loader:
+        imgs = imgs.to(DEVICE, non_blocking=True)
+        logits = model(imgs)             # shape (B,14)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        all_logits.append(probs)
+        all_targets.append(targets.numpy())
+
+all_logits = np.vstack(all_logits)   # (N,14) probabilities
+all_targets = np.vstack(all_targets) # (N,14) ground-truth multi-hot
+
+# Binarize predictions using threshold 0.5 (you can change threshold per-class)
+preds_binary = (all_logits >= 0.5).astype(int)
+
+# -------------------------
+# 10) Per-class precision/recall/f1 + global averages
+# -------------------------
+prec, rec, f1, sup = precision_recall_fscore_support(all_targets, preds_binary, average=None, zero_division=0)
+prec_macro, rec_macro, f1_macro, _ = precision_recall_fscore_support(all_targets, preds_binary, average='macro', zero_division=0)
+prec_micro, rec_micro, f1_micro, _ = precision_recall_fscore_support(all_targets, preds_binary, average='micro', zero_division=0)
+prec_weight, rec_weight, f1_weight, _ = precision_recall_fscore_support(all_targets, preds_binary, average='weighted', zero_division=0)
+
+print("\n=== Per-class metrics ===")
+for i, name in enumerate(MODEL_CLASS_NAMES):
+    print(f"{name:25s}  precision: {prec[i]:.4f}  recall: {rec[i]:.4f}  f1: {f1[i]:.4f}  support: {int(sup[i])}")
+
+print("\n=== Averages ===")
+print(f"Macro  - P: {prec_macro:.4f}  R: {rec_macro:.4f}  F1: {f1_macro:.4f}")
+print(f"Micro  - P: {prec_micro:.4f}  R: {rec_micro:.4f}  F1: {f1_micro:.4f}")
+print(f"Weight - P: {prec_weight:.4f}  R: {rec_weight:.4f}  F1: {f1_weight:.4f}")
+
+# -------------------------
+# 11) ROC-AUC per class (requires at least one positive sample per class)
+# -------------------------
+auc_per_class = {}
+for i, name in enumerate(MODEL_CLASS_NAMES):
+    y_true = all_targets[:, i]
+    y_score = all_logits[:, i]
+    try:
+        auc_val = roc_auc_score(y_true, y_score)
+        auc_per_class[name] = float(auc_val)
+    except Exception as e:
+        auc_per_class[name] = None  # not defined (no positives or other)
+        # print(f"AUC for {name} could not be computed: {e}")
+
+print("\n=== ROC-AUC per class ===")
+for k, v in auc_per_class.items():
+    print(f"{k:25s}: {v}")
+
+# Optionally plot ROC for classes that have AUC
+plt.figure(figsize=(10, 8))
+plotted = 0
+for i, name in enumerate(MODEL_CLASS_NAMES):
+    if auc_per_class[name] is None:
+        continue
+    fpr, tpr, _ = roc_curve(all_targets[:, i], all_logits[:, i])
+    plt.plot(fpr, tpr, label=f"{name} (AUC={auc_per_class[name]:.3f})")
+    plotted += 1
+if plotted:
+    plt.plot([0,1], [0,1], '--', color='gray')
+    plt.xlabel("FPR")
+    plt.ylabel("TPR")
+    plt.title("ROC Curves (per class)")
+    plt.legend(loc='lower right', fontsize='small')
+    plt.show()
+
+# -------------------------
+# 12) Save predictions & metrics to CSV for reproducibility
+# -------------------------
+df_preds = pd.DataFrame(all_logits, columns=[f"prob_{c}" for c in MODEL_CLASS_NAMES])
+df_true = pd.DataFrame(all_targets, columns=[f"true_{c}" for c in MODEL_CLASS_NAMES])
+df_bin = pd.DataFrame(preds_binary, columns=[f"pred_{c}" for c in MODEL_CLASS_NAMES])
+
+df_out = pd.concat([df_true, df_preds, df_bin], axis=1)
+df_out.to_csv("pbc_finetune_predictions_and_probs.csv", index=False)
+print("\nSaved predictions and probabilities to 'pbc_finetune_predictions_and_probs.csv'")
+
+# -------------------------
+# 13) Print summary & finish
+# -------------------------
+print("\nFinished fine-tuning + evaluation. Best model:", OUTPUT_BEST_MODEL)
